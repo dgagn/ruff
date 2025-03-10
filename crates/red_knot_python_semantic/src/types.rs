@@ -20,7 +20,7 @@ pub(crate) use self::infer::{
     infer_scope_types,
 };
 pub use self::narrow::KnownConstraintFunction;
-pub(crate) use self::signatures::{CallableSignature, Signature};
+pub(crate) use self::signatures::{CallableSignature, Signature, UnionSignature};
 pub use self::subclass_of::SubclassOfType;
 use crate::module_name::ModuleName;
 use crate::module_resolver::{file_to_module, resolve_module, KnownModule};
@@ -2294,26 +2294,14 @@ impl<'db> Type<'db> {
         non_negative_int_literal(db, return_ty)
     }
 
-    /// Calls `self`
-    ///
-    /// Returns `Ok` if the call with the given arguments is successful and `Err` otherwise.
-    fn try_call(
-        self,
-        db: &'db dyn Db,
-        arguments: &CallArguments<'_, 'db>,
-    ) -> Result<CallOutcome<'db>, CallError<'db>> {
+    /// Returns the signature of a callable type. Note that the result cannot depend on the actual
+    /// arguments of any particular call site.
+    fn call_signature(self, db: &'db dyn Db) -> Option<UnionSignature<'db>> {
         match self {
             Type::Callable(CallableType::BoundMethod(bound_method)) => {
-                let instance = bound_method.self_instance(db);
-                let arguments = arguments.with_self(instance);
-                let binding = bind_call(
-                    db,
-                    &arguments,
-                    bound_method.function(db).signature(db),
-                    self,
-                );
-                binding.into_outcome()
+                bound_method.function(db).signature(db).clone()
             }
+
             Type::Callable(CallableType::MethodWrapperDunderGet(function)) => {
                 // Here, we dynamically model the overloaded function signature of `types.FunctionType.__get__`.
                 // This is required because we need to return more precise types than what the signature in
@@ -2328,49 +2316,239 @@ impl<'db> Type<'db> {
                 //     def __get__(self, instance: object, owner: type | None = None, /) -> MethodType: ...
                 // ```
 
-                #[salsa::tracked(return_ref)]
-                fn overloads<'db>(db: &'db dyn Db) -> CallableSignature<'db> {
-                    let not_none = Type::none(db).negate(db);
-                    CallableSignature::from_overloads([
-                        Signature::new(
-                            Parameters::new([
-                                Parameter::new(
-                                    Some(Name::new_static("instance")),
-                                    Some(Type::none(db)),
-                                    ParameterKind::PositionalOnly { default_ty: None },
-                                ),
-                                Parameter::new(
-                                    Some(Name::new_static("owner")),
-                                    Some(KnownClass::Type.to_instance(db)),
-                                    ParameterKind::PositionalOnly { default_ty: None },
-                                ),
-                            ]),
-                            None,
-                        ),
-                        Signature::new(
-                            Parameters::new([
-                                Parameter::new(
-                                    Some(Name::new_static("instance")),
-                                    Some(not_none),
-                                    ParameterKind::PositionalOnly { default_ty: None },
-                                ),
-                                Parameter::new(
-                                    Some(Name::new_static("owner")),
-                                    Some(UnionType::from_elements(
-                                        db,
-                                        [KnownClass::Type.to_instance(db), Type::none(db)],
-                                    )),
-                                    ParameterKind::PositionalOnly {
-                                        default_ty: Some(Type::none(db)),
-                                    },
-                                ),
-                            ]),
-                            None,
-                        ),
-                    ])
-                }
+                let not_none = Type::none(db).negate(db);
+                Overloads::from_overloads([
+                    Signature::new(
+                        Parameters::new([
+                            Parameter::new(
+                                Some(Name::new_static("instance")),
+                                Some(Type::none(db)),
+                                ParameterKind::PositionalOnly { default_ty: None },
+                            ),
+                            Parameter::new(
+                                Some(Name::new_static("owner")),
+                                Some(KnownClass::Type.to_instance(db)),
+                                ParameterKind::PositionalOnly { default_ty: None },
+                            ),
+                        ]),
+                        None,
+                    ),
+                    Signature::new(
+                        Parameters::new([
+                            Parameter::new(
+                                Some(Name::new_static("instance")),
+                                Some(not_none),
+                                ParameterKind::PositionalOnly { default_ty: None },
+                            ),
+                            Parameter::new(
+                                Some(Name::new_static("owner")),
+                                Some(UnionType::from_elements(
+                                    db,
+                                    [KnownClass::Type.to_instance(db), Type::none(db)],
+                                )),
+                                ParameterKind::PositionalOnly {
+                                    default_ty: Some(Type::none(db)),
+                                },
+                            ),
+                        ]),
+                        None,
+                    ),
+                ])
+            }
 
-                let mut binding = bind_call(db, arguments, overloads(db), self);
+            Type::Callable(CallableType::WrapperDescriptorDunderGet) => {
+                // Here, we also model `types.FunctionType.__get__`, but now we consider a call to
+                // this as a function, i.e. we also expect the `self` argument to be passed in.
+
+                let not_none = Type::none(db).negate(db);
+                Overloads::from_overloads([
+                    Signature::new(
+                        Parameters::new([
+                            Parameter::new(
+                                Some(Name::new_static("self")),
+                                Some(KnownClass::FunctionType.to_instance(db)),
+                                ParameterKind::PositionalOnly { default_ty: None },
+                            ),
+                            Parameter::new(
+                                Some(Name::new_static("instance")),
+                                Some(Type::none(db)),
+                                ParameterKind::PositionalOnly { default_ty: None },
+                            ),
+                            Parameter::new(
+                                Some(Name::new_static("owner")),
+                                Some(KnownClass::Type.to_instance(db)),
+                                ParameterKind::PositionalOnly { default_ty: None },
+                            ),
+                        ]),
+                        None,
+                    ),
+                    Signature::new(
+                        Parameters::new([
+                            Parameter::new(
+                                Some(Name::new_static("self")),
+                                Some(KnownClass::FunctionType.to_instance(db)),
+                                ParameterKind::PositionalOnly { default_ty: None },
+                            ),
+                            Parameter::new(
+                                Some(Name::new_static("instance")),
+                                Some(not_none),
+                                ParameterKind::PositionalOnly { default_ty: None },
+                            ),
+                            Parameter::new(
+                                Some(Name::new_static("owner")),
+                                Some(UnionType::from_elements(
+                                    db,
+                                    [KnownClass::Type.to_instance(db), Type::none(db)],
+                                )),
+                                ParameterKind::PositionalOnly {
+                                    default_ty: Some(Type::none(db)),
+                                },
+                            ),
+                        ]),
+                        None,
+                    ),
+                ])
+            }
+
+            Type::FunctionLiteral(function_type) => function_type.signature(db).clone(),
+
+            Type::ClassLiteral(ClassLiteralType { class })
+                if class.is_known(db, KnownClass::Bool) =>
+            {
+                // ```py
+                // class bool(int):
+                //     def __new__(cls, o: object = ..., /) -> Self: ...
+                // ```
+                Signature::new(
+                    Parameters::new([Parameter::new(
+                        Some(Name::new_static("o")),
+                        Some(Type::any()),
+                        ParameterKind::PositionalOnly {
+                            default_ty: Some(Type::BooleanLiteral(false)),
+                        },
+                    )]),
+                    Some(self.to_instance(db)),
+                )
+                .into()
+            }
+
+            Type::ClassLiteral(ClassLiteralType { class })
+                if class.is_known(db, KnownClass::Str) =>
+            {
+                // ```py
+                // class str(Sequence[str]):
+                //     @overload
+                //     def __new__(cls, object: object = ...) -> Self: ...
+                //     @overload
+                //     def __new__(cls, object: ReadableBuffer, encoding: str = ..., errors: str = ...) -> Self: ...
+                // ```
+                Overloads::from_overloads([
+                    Signature::new(
+                        Parameters::new([Parameter::new(
+                            Some(Name::new_static("o")),
+                            Some(Type::any()),
+                            ParameterKind::PositionalOnly {
+                                default_ty: Some(Type::string_literal(db, "")),
+                            },
+                        )]),
+                        Some(self.to_instance(db)),
+                    ),
+                    Signature::new(
+                        Parameters::new([
+                            Parameter::new(
+                                Some(Name::new_static("o")),
+                                Some(Type::any()), // TODO: ReadableBuffer
+                                ParameterKind::PositionalOnly { default_ty: None },
+                            ),
+                            Parameter::new(
+                                Some(Name::new_static("encoding")),
+                                Some(KnownClass::Str.to_instance(db)),
+                                ParameterKind::PositionalOnly { default_ty: None },
+                            ),
+                            Parameter::new(
+                                Some(Name::new_static("errors")),
+                                Some(KnownClass::Str.to_instance(db)),
+                                ParameterKind::PositionalOnly { default_ty: None },
+                            ),
+                        ]),
+                        Some(self.to_instance(db)),
+                    ),
+                ])
+            }
+
+            Type::ClassLiteral(ClassLiteralType { class })
+                if class.is_known(db, KnownClass::Type) =>
+            {
+                // ```py
+                // class type:
+                //     @overload
+                //     def __init__(self, o: object, /) -> None: ...
+                //     @overload
+                //     def __init__(self, name: str, bases: tuple[type, ...], dict: dict[str, Any], /, **kwds: Any) -> None: ...
+                // ```
+                Overloads::from_overloads([
+                    Signature::new(
+                        Parameters::new([Parameter::new(
+                            Some(Name::new_static("o")),
+                            Some(Type::any()),
+                            ParameterKind::PositionalOnly { default_ty: None },
+                        )]),
+                        Some(self.to_instance(db)),
+                    ),
+                    Signature::new(
+                        Parameters::new([
+                            Parameter::new(
+                                Some(Name::new_static("o")),
+                                Some(Type::any()),
+                                ParameterKind::PositionalOnly { default_ty: None },
+                            ),
+                            Parameter::new(
+                                Some(Name::new_static("bases")),
+                                Some(Type::any()),
+                                ParameterKind::PositionalOnly { default_ty: None },
+                            ),
+                            Parameter::new(
+                                Some(Name::new_static("dict")),
+                                Some(Type::any()),
+                                ParameterKind::PositionalOnly { default_ty: None },
+                            ),
+                        ]),
+                        Some(self.to_instance(db)),
+                    ),
+                ])
+            }
+
+            // TODO annotated return type on `__new__` or metaclass `__call__`
+            // TODO check call vs signatures of `__new__` and/or `__init__`
+            Type::ClassLiteral(ClassLiteralType { .. }) => {
+                Signature::new(Parameters::gradual_form(), Some(self.to_instance(db))).into()
+            }
+
+            Type::SubclassOf(subclass_of_type) => match subclass_of_type.subclass_of() {
+                ClassBase::Dynamic(dynamic_type) => Type::Dynamic(dynamic_type).call_signature(db),
+                ClassBase::Class(class) => Type::class_literal(class).call_signature(db),
+            },
+        }
+    }
+
+    /// Calls `self`
+    ///
+    /// Returns `Ok` if the call with the given arguments is successful and `Err` otherwise.
+    fn try_call(
+        self,
+        db: &'db dyn Db,
+        arguments: &CallArguments<'_, 'db>,
+    ) -> Result<CallOutcome<'db>, CallError<'db>> {
+        let overloads = self.call_signature(db);
+        match self {
+            Type::Callable(CallableType::BoundMethod(bound_method)) => {
+                let instance = bound_method.self_instance(db);
+                let arguments = arguments.with_self(instance);
+                let binding = bind_call(db, &arguments, &overloads, self);
+                binding.into_outcome()
+            }
+            Type::Callable(CallableType::MethodWrapperDunderGet(function)) => {
+                let mut binding = bind_call(db, arguments, &overloads, self);
                 let Some((_, overload)) = binding.matching_overload_mut() else {
                     return Err(CallError::BindingError { binding });
                 };
@@ -2402,65 +2580,7 @@ impl<'db> Type<'db> {
                 binding.into_outcome()
             }
             Type::Callable(CallableType::WrapperDescriptorDunderGet) => {
-                // Here, we also model `types.FunctionType.__get__`, but now we consider a call to
-                // this as a function, i.e. we also expect the `self` argument to be passed in.
-
-                // TODO: Consider merging this signature with the one in the previous match clause,
-                // since the previous one is just this signature with the `self` parameters
-                // removed.
-                #[salsa::tracked(return_ref)]
-                fn overloads<'db>(db: &'db dyn Db) -> CallableSignature<'db> {
-                    let not_none = Type::none(db).negate(db);
-                    CallableSignature::from_overloads([
-                        Signature::new(
-                            Parameters::new([
-                                Parameter::new(
-                                    Some(Name::new_static("self")),
-                                    Some(KnownClass::FunctionType.to_instance(db)),
-                                    ParameterKind::PositionalOnly { default_ty: None },
-                                ),
-                                Parameter::new(
-                                    Some(Name::new_static("instance")),
-                                    Some(Type::none(db)),
-                                    ParameterKind::PositionalOnly { default_ty: None },
-                                ),
-                                Parameter::new(
-                                    Some(Name::new_static("owner")),
-                                    Some(KnownClass::Type.to_instance(db)),
-                                    ParameterKind::PositionalOnly { default_ty: None },
-                                ),
-                            ]),
-                            None,
-                        ),
-                        Signature::new(
-                            Parameters::new([
-                                Parameter::new(
-                                    Some(Name::new_static("self")),
-                                    Some(KnownClass::FunctionType.to_instance(db)),
-                                    ParameterKind::PositionalOnly { default_ty: None },
-                                ),
-                                Parameter::new(
-                                    Some(Name::new_static("instance")),
-                                    Some(not_none),
-                                    ParameterKind::PositionalOnly { default_ty: None },
-                                ),
-                                Parameter::new(
-                                    Some(Name::new_static("owner")),
-                                    Some(UnionType::from_elements(
-                                        db,
-                                        [KnownClass::Type.to_instance(db), Type::none(db)],
-                                    )),
-                                    ParameterKind::PositionalOnly {
-                                        default_ty: Some(Type::none(db)),
-                                    },
-                                ),
-                            ]),
-                            None,
-                        ),
-                    ])
-                }
-
-                let mut binding = bind_call(db, arguments, overloads(db), self);
+                let mut binding = bind_call(db, arguments, &overloads, self);
                 let Some((_, overload)) = binding.matching_overload_mut() else {
                     return Err(CallError::BindingError { binding });
                 };
@@ -2530,7 +2650,7 @@ impl<'db> Type<'db> {
                 binding.into_outcome()
             }
             Type::FunctionLiteral(function_type) => {
-                let mut binding = bind_call(db, arguments, function_type.signature(db), self);
+                let mut binding = bind_call(db, arguments, &overloads, self);
                 let Some((_, overload)) = binding.matching_overload_mut() else {
                     return Err(CallError::BindingError { binding });
                 };
@@ -2663,26 +2783,7 @@ impl<'db> Type<'db> {
             Type::ClassLiteral(ClassLiteralType { class })
                 if class.is_known(db, KnownClass::Bool) =>
             {
-                // ```py
-                // class bool(int):
-                //     def __new__(cls, o: object = ..., /) -> Self: ...
-                // ```
-                #[salsa::tracked(return_ref)]
-                fn overloads<'db>(db: &'db dyn Db) -> CallableSignature<'db> {
-                    Signature::new(
-                        Parameters::new([Parameter::new(
-                            Some(Name::new_static("o")),
-                            Some(Type::any()),
-                            ParameterKind::PositionalOnly {
-                                default_ty: Some(Type::BooleanLiteral(false)),
-                            },
-                        )]),
-                        Some(KnownClass::Bool.to_instance(db)),
-                    )
-                    .into()
-                }
-
-                let mut binding = bind_call(db, arguments, overloads(db), self);
+                let mut binding = bind_call(db, arguments, &overloads, self);
                 let Some((_, overload)) = binding.matching_overload_mut() else {
                     return Err(CallError::BindingError { binding });
                 };
@@ -2698,50 +2799,7 @@ impl<'db> Type<'db> {
             Type::ClassLiteral(ClassLiteralType { class })
                 if class.is_known(db, KnownClass::Str) =>
             {
-                // ```py
-                // class str(Sequence[str]):
-                //     @overload
-                //     def __new__(cls, object: object = ...) -> Self: ...
-                //     @overload
-                //     def __new__(cls, object: ReadableBuffer, encoding: str = ..., errors: str = ...) -> Self: ...
-                // ```
-                #[salsa::tracked(return_ref)]
-                fn overloads<'db>(db: &'db dyn Db) -> CallableSignature<'db> {
-                    CallableSignature::from_overloads([
-                        Signature::new(
-                            Parameters::new([Parameter::new(
-                                Some(Name::new_static("o")),
-                                Some(Type::any()),
-                                ParameterKind::PositionalOnly {
-                                    default_ty: Some(Type::string_literal(db, "")),
-                                },
-                            )]),
-                            Some(KnownClass::Str.to_instance(db)),
-                        ),
-                        Signature::new(
-                            Parameters::new([
-                                Parameter::new(
-                                    Some(Name::new_static("o")),
-                                    Some(Type::any()), // TODO: ReadableBuffer
-                                    ParameterKind::PositionalOnly { default_ty: None },
-                                ),
-                                Parameter::new(
-                                    Some(Name::new_static("encoding")),
-                                    Some(KnownClass::Str.to_instance(db)),
-                                    ParameterKind::PositionalOnly { default_ty: None },
-                                ),
-                                Parameter::new(
-                                    Some(Name::new_static("errors")),
-                                    Some(KnownClass::Str.to_instance(db)),
-                                    ParameterKind::PositionalOnly { default_ty: None },
-                                ),
-                            ]),
-                            Some(KnownClass::Str.to_instance(db)),
-                        ),
-                    ])
-                }
-
-                let mut binding = bind_call(db, arguments, overloads(db), self);
+                let mut binding = bind_call(db, arguments, &overloads, self);
                 let Some((index, overload)) = binding.matching_overload_mut() else {
                     return Err(CallError::BindingError { binding });
                 };
@@ -2759,48 +2817,7 @@ impl<'db> Type<'db> {
             Type::ClassLiteral(ClassLiteralType { class })
                 if class.is_known(db, KnownClass::Type) =>
             {
-                // ```py
-                // class type:
-                //     @overload
-                //     def __init__(self, o: object, /) -> None: ...
-                //     @overload
-                //     def __init__(self, name: str, bases: tuple[type, ...], dict: dict[str, Any], /, **kwds: Any) -> None: ...
-                // ```
-                #[salsa::tracked(return_ref)]
-                fn overloads<'db>(db: &'db dyn Db) -> CallableSignature<'db> {
-                    CallableSignature::from_overloads([
-                        Signature::new(
-                            Parameters::new([Parameter::new(
-                                Some(Name::new_static("o")),
-                                Some(Type::any()),
-                                ParameterKind::PositionalOnly { default_ty: None },
-                            )]),
-                            Some(KnownClass::Type.to_instance(db)),
-                        ),
-                        Signature::new(
-                            Parameters::new([
-                                Parameter::new(
-                                    Some(Name::new_static("o")),
-                                    Some(Type::any()),
-                                    ParameterKind::PositionalOnly { default_ty: None },
-                                ),
-                                Parameter::new(
-                                    Some(Name::new_static("bases")),
-                                    Some(Type::any()),
-                                    ParameterKind::PositionalOnly { default_ty: None },
-                                ),
-                                Parameter::new(
-                                    Some(Name::new_static("dict")),
-                                    Some(Type::any()),
-                                    ParameterKind::PositionalOnly { default_ty: None },
-                                ),
-                            ]),
-                            Some(KnownClass::Type.to_instance(db)),
-                        ),
-                    ])
-                }
-
-                let mut binding = bind_call(db, arguments, overloads(db), self);
+                let mut binding = bind_call(db, arguments, &overloads, self);
                 let Some((index, overload)) = binding.matching_overload_mut() else {
                     return Err(CallError::BindingError { binding });
                 };
@@ -2815,8 +2832,7 @@ impl<'db> Type<'db> {
             // TODO annotated return type on `__new__` or metaclass `__call__`
             // TODO check call vs signatures of `__new__` and/or `__init__`
             Type::ClassLiteral(ClassLiteralType { .. }) => {
-                let signature = Signature::new(Parameters::gradual_form(), self.to_instance(db));
-                let binding = bind_call(db, arguments, &signature.into(), self);
+                let binding = bind_call(db, arguments, &overloads, self);
                 binding.into_outcome()
             }
 
@@ -2888,6 +2904,9 @@ impl<'db> Type<'db> {
             }),
         }
     }
+
+    /// Returns the signature of a dunder method on the meta-type of `self`.
+    fn dunder_signature(self, db: &'db dyn Db, name: &str) -> Option<UnionSignature<'db>> {}
 
     /// Look up a dunder method on the meta-type of `self` and call it.
     ///

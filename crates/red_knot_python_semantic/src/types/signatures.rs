@@ -15,6 +15,12 @@ use crate::Db;
 use crate::{semantic_index::definition::Definition, types::todo_type};
 use ruff_python_ast::{self as ast, name::Name};
 
+/// The signature of a possible union of callables.
+pub struct UnionSignature<'db> {
+    Single(CallableSignature<'db>),
+    Union(Box<[CallableSignature<'db>]>),
+}
+
 /// The signature of a single callable. If the callable is overloaded, there is a separate
 /// [`Signature`] for each overload.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, salsa::Update)]
