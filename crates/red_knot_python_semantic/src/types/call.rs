@@ -5,7 +5,7 @@ use crate::Db;
 
 mod arguments;
 mod bind;
-pub(super) use arguments::{Argument, CallArguments};
+pub(super) use arguments::{Argument, ArgumentKind, CallArguments};
 pub(super) use bind::{bind_call, CallBinding};
 
 /// A successfully bound call where all arguments are valid.

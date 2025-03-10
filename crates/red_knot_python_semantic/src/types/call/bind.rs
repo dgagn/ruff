@@ -1,6 +1,6 @@
 use super::{
-    Argument, CallArguments, CallError, CallOutcome, CallableSignature, InferContext, Signature,
-    Type,
+    ArgumentKind, CallArguments, CallError, CallOutcome, CallableSignature, InferContext,
+    Signature, Type,
 };
 use crate::db::Db;
 use crate::types::diagnostic::{
@@ -64,9 +64,10 @@ fn bind_overload<'db>(
         }
     };
     for (argument_index, argument) in arguments.iter().enumerate() {
-        let (index, parameter, argument_ty, positional) = match argument {
-            Argument::Positional(ty) | Argument::Synthetic(ty) => {
-                if matches!(argument, Argument::Synthetic(_)) {
+        let argument_ty = argument.ty();
+        let (index, parameter, positional) = match argument.kind() {
+            ArgumentKind::Positional | ArgumentKind::Synthetic => {
+                if matches!(argument.kind(), ArgumentKind::Synthetic) {
                     num_synthetic_args += 1;
                 }
                 let Some((index, parameter)) = parameters
@@ -79,9 +80,9 @@ fn bind_overload<'db>(
                     continue;
                 };
                 next_positional += 1;
-                (index, parameter, ty, !parameter.is_variadic())
+                (index, parameter, !parameter.is_variadic())
             }
-            Argument::Keyword { name, ty } => {
+            ArgumentKind::Keyword(name) => {
                 let Some((index, parameter)) = parameters
                     .keyword_by_name(name)
                     .or_else(|| parameters.keyword_variadic())
@@ -92,10 +93,10 @@ fn bind_overload<'db>(
                     });
                     continue;
                 };
-                (index, parameter, ty, false)
+                (index, parameter, false)
             }
 
-            Argument::Variadic(_) | Argument::Keywords(_) => {
+            ArgumentKind::Variadic | ArgumentKind::Keywords => {
                 // TODO
                 continue;
             }
@@ -106,13 +107,13 @@ fn bind_overload<'db>(
                     parameter: ParameterContext::new(parameter, index, positional),
                     argument_index: get_argument_index(argument_index, num_synthetic_args),
                     expected_ty,
-                    provided_ty: *argument_ty,
+                    provided_ty: argument_ty,
                 });
             }
         }
-        if let Some(existing) = parameter_tys[index].replace(*argument_ty) {
+        if let Some(existing) = parameter_tys[index].replace(argument_ty) {
             if parameter.is_variadic() || parameter.is_keyword_variadic() {
-                let union = UnionType::from_elements(db, [existing, *argument_ty]);
+                let union = UnionType::from_elements(db, [existing, argument_ty]);
                 parameter_tys[index].replace(union);
             } else {
                 errors.push(CallBindingError::ParameterAlreadyAssigned {
